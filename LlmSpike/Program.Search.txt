@@ -1,0 +1,241 @@
+﻿using System.Text;
+using Azure;
+using Azure.AI.OpenAI;
+using Azure.Search.Documents;
+using Azure.Search.Documents.Indexes;
+using Azure.Search.Documents.Indexes.Models;
+using Azure.Search.Documents.Models;
+using Microsoft.Extensions.Configuration;
+using OpenAI.Chat;
+using OpenAI.Embeddings;
+
+var config = new ConfigurationBuilder()
+    .AddUserSecrets<Program>()
+    .Build();
+
+// --- Azure OpenAI: same as before ---
+var openAiClient = new AzureOpenAIClient(
+    new Uri(config["AOAI_ENDPOINT"]!),
+    new AzureKeyCredential(config["AOAI_KEY"]!));
+
+var chat = openAiClient.GetChatClient("chat");
+var embed = openAiClient.GetEmbeddingClient("embeddings");
+
+// --- Azure AI Search: new ---
+string searchEndpoint = config["SEARCH_ENDPOINT"]!;
+var searchCredential = new AzureKeyCredential(config["SEARCH_KEY"]!);
+string indexName = "customs-chunks";
+
+// indexClient manages indexes (schema). searchClient works with documents inside one index.
+var indexClient = new SearchIndexClient(new Uri(searchEndpoint), searchCredential);
+var searchClient = new SearchClient(new Uri(searchEndpoint), indexName, searchCredential);
+
+
+// ---------------------------------------------------------------
+// 1. Define the index schema
+// ---------------------------------------------------------------
+
+var definition = new SearchIndex(indexName)
+{
+    Fields =
+    {
+        // Every index needs exactly one key field.
+        new SimpleField("id", SearchFieldDataType.String) { IsKey = true },
+
+        // Searchable = participates in keyword (BM25) search.
+        new SearchableField("content") { IsFilterable = false },
+
+        // The vector field. Collection of floats.
+        new SearchField("contentVector", SearchFieldDataType.Collection(SearchFieldDataType.Single))
+        {
+            IsSearchable = true,
+            VectorSearchDimensions = 1536,        // must match text-embedding-3-small exactly
+            VectorSearchProfileName = "vector-profile"
+        }
+    },
+
+    VectorSearch = new VectorSearch
+    {
+        // The algorithm: HNSW graph index for approximate nearest neighbour.
+        Algorithms =
+        {
+            new HnswAlgorithmConfiguration("hnsw-config")
+        },
+        // A profile ties a field to an algorithm. The field references the profile by name.
+        Profiles =
+        {
+            new VectorSearchProfile("vector-profile", "hnsw-config")
+        }
+    }
+};
+
+await indexClient.CreateOrUpdateIndexAsync(definition);
+Console.WriteLine($"Index '{indexName}' ready.");
+
+
+// ---------------------------------------------------------------
+// 2. Chunk the document (unchanged from before)
+// ---------------------------------------------------------------
+
+string document = @"
+Customs Declaration CD-2024-08817. Importer of record: Nordwind Logistics LLC,
+registered at 12 Neftchilar Avenue, Baku. Declaration submitted 14 March 2024
+at the Baku Customs Post.
+
+The consignment contains 480 units of stainless steel fittings, HS code 7307.29,
+with a declared customs value of 62,400 USD. Country of origin is Turkiye.
+Gross weight is 1,850 kg across 24 pallets.
+
+Import duty is assessed at 5 percent of customs value, giving 3,120 USD.
+Value added tax is applied at 18 percent on the sum of customs value and duty,
+giving 11,793.60 USD. Total payable to customs is 14,913.60 USD.
+
+Payment is due within 15 calendar days of declaration acceptance. Late payment
+incurs a penalty of 0.1 percent of the outstanding amount per day.
+
+Additional provisions. Goods may be inspected at the discretion of the customs
+officer. Release is conditional on presentation of the original commercial
+invoice and the certificate of origin.
+";
+
+var paragraphs = document.Split(
+    new[] { "\r\n\r\n", "\n\n" },
+    StringSplitOptions.RemoveEmptyEntries);
+
+var chunks = new List<string>();
+foreach (var paragraph in paragraphs)
+{
+    string cleaned = paragraph
+        .Replace("\r\n", " ")
+        .Replace("\n", " ")
+        .Trim();
+
+    if (cleaned.Length > 0)
+    {
+        chunks.Add(cleaned);
+    }
+}
+
+Console.WriteLine($"Split into {chunks.Count} chunks.");
+
+
+// ---------------------------------------------------------------
+// 3. Embed the chunks and upload them to the index
+// ---------------------------------------------------------------
+
+var chunkEmbeddings = await embed.GenerateEmbeddingsAsync(chunks);
+
+var documents = new List<SearchDocument>();
+for (int i = 0; i < chunks.Count; i++)
+{
+    float[] vector = chunkEmbeddings.Value[i].ToFloats().ToArray();
+
+    var searchDocument = new SearchDocument
+    {
+        ["id"] = i.ToString(),
+        ["content"] = chunks[i],
+        ["contentVector"] = vector
+    };
+
+    documents.Add(searchDocument);
+}
+
+await searchClient.IndexDocumentsAsync(IndexDocumentsBatch.Upload(documents));
+Console.WriteLine($"Uploaded {documents.Count} documents.");
+
+// Indexing is not instant. Give it a moment before querying.
+await Task.Delay(3000);
+
+
+// ---------------------------------------------------------------
+// 4. Ask questions
+// ---------------------------------------------------------------
+
+await Answer("How much duty is owed on this shipment?");
+await Answer("What happens if payment is late?");
+await Answer("What is the total payable including VAT?");
+await Answer("What is the capital of France?");
+await Answer("CD-2024-08817");
+
+
+// ---------------------------------------------------------------
+// Retrieve from Azure AI Search, then generate
+// ---------------------------------------------------------------
+
+async Task Answer(string query)
+{
+    Console.WriteLine();
+    Console.WriteLine($"=== {query} ===");
+
+    // Embed the question — same model, same vector space as the chunks
+    var queryEmbedding = await embed.GenerateEmbeddingAsync(query);
+    float[] queryVector = queryEmbedding.Value.ToFloats().ToArray();
+
+    // This replaces the hand-written scoring loop
+    var vectorQuery = new VectorizedQuery(queryVector)
+    {
+        KNearestNeighborsCount = 3
+    };
+    vectorQuery.Fields.Add("contentVector");
+
+    var options = new SearchOptions
+    {
+        VectorSearch = new VectorSearchOptions()
+    };
+    options.VectorSearch.Queries.Add(vectorQuery);
+
+    // null search text = pure vector search, no keyword component
+    var response = await searchClient.SearchAsync<SearchDocument>(query, options);
+
+    var retrieved = new List<(string Text, double Score)>();
+
+    await foreach (var result in response.Value.GetResultsAsync())
+    {
+        string text = result.Document["content"].ToString()!;
+        double score = result.Score ?? 0;
+        retrieved.Add((text, score));
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("Retrieved:");
+    foreach (var item in retrieved)
+    {
+        string preview = item.Text.Length > 60
+            ? item.Text.Substring(0, 60) + "..."
+            : item.Text;
+
+        Console.WriteLine($"  {item.Score:F4}  {preview}");
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("Answer: " + await Ask(query, retrieved));
+}
+
+
+async Task<string> Ask(string query, List<(string Text, double Score)> retrieved)
+{
+    var builder = new StringBuilder();
+    foreach (var item in retrieved)
+    {
+        builder.AppendLine($"- {item.Text}");
+    }
+
+    string context = builder.Length == 0
+        ? "(no relevant content found)"
+        : builder.ToString();
+
+    string systemPrompt =
+        "Answer the question using only the context provided. " +
+        "If the context does not contain the answer, say you don't know.";
+
+    string userPrompt = $"Context:\n{context}\nQuestion: {query}";
+
+    var response = await chat.CompleteChatAsync(
+        new SystemChatMessage(systemPrompt),
+        new UserChatMessage(userPrompt));
+
+    return response.Value.Content[0].Text;
+}
+
+
+public partial class Program { }

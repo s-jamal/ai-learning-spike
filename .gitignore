@@ -1,0 +1,17 @@
+# Build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+artifacts/
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Secrets never belong here — this project uses dotnet user-secrets,
+# which stores values outside the repo. See README.
+appsettings.*.local.json
+*.env

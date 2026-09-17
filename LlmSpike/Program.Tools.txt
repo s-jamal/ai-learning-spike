@@ -1,0 +1,190 @@
+﻿using System.Text.Json;
+using Azure;
+using Azure.AI.OpenAI;
+using Microsoft.Extensions.Configuration;
+using OpenAI.Chat;
+
+var config = new ConfigurationBuilder()
+    .AddUserSecrets<Program>()
+    .Build();
+
+var openAiClient = new AzureOpenAIClient(
+    new Uri(config["AOAI_ENDPOINT"]!),
+    new AzureKeyCredential(config["AOAI_KEY"]!));
+
+var chat = openAiClient.GetChatClient("chat");
+
+
+// ---------------------------------------------------------------
+// 1. The actual C# methods. Ordinary code, nothing AI about them.
+// ---------------------------------------------------------------
+
+static decimal CalculateLatePenalty(decimal amount, int daysLate)
+{
+    decimal dailyRate = 0.001m;   // 0.1 percent per day
+    return amount * dailyRate * daysLate;
+}
+
+static decimal ConvertCurrency(decimal amount, string toCurrency)
+{
+    // Hardcoded rates. A real version would call an API.
+    decimal rate = toCurrency.ToUpperInvariant() switch
+    {
+        "EUR" => 0.92m,
+        "AZN" => 1.70m,
+        "GBP" => 0.79m,
+        _ => throw new ArgumentException($"Unknown currency: {toCurrency}")
+    };
+
+    return amount * rate;
+}
+
+
+// ---------------------------------------------------------------
+// 2. Describe those methods to the model
+// ---------------------------------------------------------------
+
+var penaltyTool = ChatTool.CreateFunctionTool(
+    functionName: "calculate_late_penalty",
+    functionDescription: "Calculates the late payment penalty on a customs amount. "
+                       + "Use this whenever the user asks about penalties for late payment.",
+    functionParameters: BinaryData.FromString("""
+    {
+        "type": "object",
+        "properties": {
+            "amount": {
+                "type": "number",
+                "description": "The outstanding amount in USD"
+            },
+            "daysLate": {
+                "type": "integer",
+                "description": "How many days the payment is overdue"
+            }
+        },
+        "required": ["amount", "daysLate"]
+    }
+    """));
+
+var currencyTool = ChatTool.CreateFunctionTool(
+    functionName: "convert_currency",
+    functionDescription: "Converts an amount in USD to another currency. "
+                   + "Supported: EUR, AZN, GBP.",
+    functionParameters: BinaryData.FromString("""
+    {
+        "type": "object",
+        "properties": {
+            "amount": {
+                "type": "number",
+                "description": "The amount in USD"
+            },
+            "toCurrency": {
+                "type": "string",
+                "description": "Target currency code, for example EUR"
+            }
+        },
+        "required": ["amount", "toCurrency"]
+    }
+    """));
+
+var options = new ChatCompletionOptions();
+options.Tools.Add(penaltyTool);
+options.Tools.Add(currencyTool);
+
+
+// ---------------------------------------------------------------
+// 3. Run some questions
+// ---------------------------------------------------------------
+
+// await Ask("The total payable is 14,913.60 USD. What is the penalty if I pay 30 days late?");
+// await Ask("Convert 14,913.60 USD to euros.");
+await Ask("The total payable is 14,913.60 USD. What's the penalty for 30 days late, in euros?");
+await Ask("Convert 14,913.60 USD to Japanese yen.");
+await Ask("What is the capital of France?");
+
+
+async Task Ask(string question)
+{
+    Console.WriteLine();
+    Console.WriteLine($"=== {question} ===");
+
+    // The conversation so far. This list grows as tools get called.
+    var messages = new List<ChatMessage>
+    {
+        new SystemChatMessage("ou are a customs assistant. Only answer questions about customs declarations and payments. Decline anything else."),
+        new UserChatMessage(question)
+    };
+
+    // Loop, because one answer may need several tool calls in sequence.
+    while (true)
+    {
+        var completion = await chat.CompleteChatAsync(messages, options);
+        var result = completion.Value;
+
+        // The model finished normally — it has an answer for us.
+        if (result.FinishReason != ChatFinishReason.ToolCalls)
+        {
+            Console.WriteLine("Answer: " + result.Content[0].Text);
+            return;
+        }
+
+        // The model is asking us to run something.
+        // Record its request in the conversation before we respond to it.
+        messages.Add(new AssistantChatMessage(result));
+
+        foreach (var toolCall in result.ToolCalls)
+        {
+            Console.WriteLine($"  [model requested: {toolCall.FunctionName}]");
+            Console.WriteLine($"  [arguments: {toolCall.FunctionArguments}]");
+
+            string output = RunTool(toolCall.FunctionName, toolCall.FunctionArguments);
+
+            Console.WriteLine($"  [returned: {output}]");
+
+            // Tool results go back keyed by the call id
+            messages.Add(new ToolChatMessage(toolCall.Id, output));
+        }
+
+        // Loop round: the model now sees the results and continues.
+    }
+}
+
+
+// ---------------------------------------------------------------
+// Dispatch: our code decides what actually runs
+// ---------------------------------------------------------------
+
+static string RunTool(string name, BinaryData arguments)
+{
+    try
+    {
+        using var json = JsonDocument.Parse(arguments);
+        var root = json.RootElement;
+
+        if (name == "calculate_late_penalty")
+        {
+            decimal amount = root.GetProperty("amount").GetDecimal();
+            int daysLate = root.GetProperty("daysLate").GetInt32();
+
+            decimal penalty = CalculateLatePenalty(amount, daysLate);
+            return $"{penalty:F2} USD";
+        }
+
+        if (name == "convert_currency")
+        {
+            decimal amount = root.GetProperty("amount").GetDecimal();
+            string currency = root.GetProperty("toCurrency").GetString()!;
+
+            decimal converted = ConvertCurrency(amount, currency);
+            return $"{converted:F2} {currency.ToUpperInvariant()}";
+        }
+
+        return $"Error: no such tool '{name}'";
+        }
+    catch (Exception ex)
+    {
+        return $"Error: {ex.Message}";
+    }
+}
+
+
+public partial class Program { }
