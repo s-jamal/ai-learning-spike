@@ -10,14 +10,34 @@ including the eval suite it runs against itself.
 
 ---
 
-## Start here each session
+## What broke, and why
 
-1. Read this file (2 minutes).
-2. `cd LlmSpike && dotnet run` to confirm it still works.
-3. Pick up at **What's next** below.
+Three failures were produced deliberately and confirmed by reverting a single variable.
+They are the point of the spike; the working code is the easy part.
 
-Detailed reasoning, experiments and failure findings live in [`notes/`](notes/) — read those
-only when you need the *why* behind a specific decision, not to re-orient.
+**1. Bad chunk boundaries break answers that grounding instructions cannot save.**
+Splitting the document on single newlines instead of paragraph breaks severed a paragraph
+mid-thought. Asked for a VAT-inclusive total, the model returned a confident, well-formatted
+**17,598.05** against a correct **14,913.60** — showing its working. It had obeyed the
+instruction to use only the supplied context. The context arrived damaged. Restoring
+paragraph splitting restored the right answer, with nothing else changed.
+
+**2. Model arithmetic is unreliable, and the fix is a function, not a better prompt.**
+Giving the model a C# method to call moved the calculation out of the language model
+entirely.
+
+**3. A function fixes calculation, but not extraction.** Re-breaking the chunking later fed
+`14,793.60` — a number that appears nowhere in the document, apparently blended from
+`11,793.60` and `14,913.60` — into a correct penalty calculation. The arithmetic was
+flawless; the argument was corrupt, so the answer was a perfectly computed **443.81**
+instead of **447.41**. Garbage in, correctly-computed garbage out, and harder to spot than
+an arithmetic error because the output is internally consistent.
+
+That third one was caught by an eval asserting the *right* answer. The guard against the
+first bug's wrong number never fired, because the same root cause surfaced a different one —
+wrong answers are unbounded, so you cannot enumerate them.
+
+Full write-ups in [`notes/`](notes/).
 
 ---
 
@@ -77,7 +97,8 @@ A hardcoded customs declaration is indexed, then seven eval cases are run agains
 
 The index is dropped rather than updated because documents are keyed by position, so
 re-indexing a smaller set would silently orphan the surplus rows. That bug is written up in
-`notes/session4-evals.md`.
+[`notes/session4-evals.md`](notes/session4-evals.md) — a suite that passed 7/7 against an
+index holding nine stale chunks.
 
 Retrieval is one of the tools, not a fixed pipeline step, so the model decides whether to
 search, writes its own search query, and can search more than once. That choice is the
@@ -85,9 +106,7 @@ most important thing in the file.
 
 ---
 
-## What's done
-
-Roughly 6 hours across three sessions. Covered and verified working:
+## What's covered
 
 - Stateless chat calls, message arrays, system prompts
 - Embeddings, vector dimensions, cosine similarity written by hand
@@ -98,20 +117,6 @@ Roughly 6 hours across three sessions. Covered and verified working:
 - Multi-step chaining — search feeding a calculation, unprompted
 - Prompt-level scope control
 - An eval suite: seven cases, pass/fail per case, non-zero exit on failure
-
-Three confirmed failure findings, all written up in the notes and all worth being able to
-tell from memory:
-
-1. **Line-split instead of paragraph-split chunking** severed a paragraph mid-thought and
-   the model returned a confidently wrong VAT total (17,598.05 against a correct
-   14,913.60). Reverting the split fixed it — one variable, opposite outcome.
-   Grounding instructions prevent invention but not misreading of damaged context.
-2. **Model arithmetic is unreliable.** The fix is a function, not a better prompt.
-3. **A function fixes calculation, not extraction.** Re-breaking the chunking fed
-   `14,793.60` — a number found nowhere in the document — into a correct penalty
-   calculation, producing a flawlessly computed 443.81 instead of 447.41. The eval caught
-   it by asserting the *right* answer; the `MustNotContain` guard against session 1's
-   17,598.05 never fired, because the same root cause produced a different wrong number.
 
 ---
 
@@ -130,26 +135,16 @@ This spike is the reference, not the starting point.
 
 **Deliberately skipped — Semantic Kernel.** A keyword rather than a necessity; plenty of
 production .NET LLM work runs against the raw SDK. Adding an abstraction over mechanics
-just learned by hand is a net loss at a few hours a week.
+just learned by hand is a net loss.
 
 ---
-
-## Working notes
-
-- Time budget is 1–2 hours a week, so context loss between sessions is the dominant cost.
-  That's what this file is for. Keep it current; it's cheaper than re-reading `notes/`.
-- The spike went well partly because the code was typed and read before being run. Prefer
-  asking for the *shape* of a mechanism over a finished implementation — compiler errors
-  and fixing them is what sticks.
-- The working test for whether a session actually landed: **can you walk someone through
-  the file and justify the structure without reading the comments?**
 
 ## Repo layout
 
 ```
 README.md                  you are here
 LlmSpike/
-  Program.cs               the current program: RAG + tools merged
+  Program.cs               the current program: RAG + tools + evals
   Program.Search.txt       frozen snapshot — session 2, retrieval only
   Program.Tools.txt        frozen snapshot — session 3, tools only
 notes/
@@ -158,6 +153,7 @@ notes/
   session3-function-calling.md
   session3-part2-rag-plus-tools.md
   session4-evals.md
+  working-notes.md         how to pick the project back up
 ```
 
 The two `.txt` snapshots are kept deliberately: they show the two halves separately, before
