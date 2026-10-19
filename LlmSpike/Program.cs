@@ -53,6 +53,25 @@ var definition = new SearchIndex(indexName)
     }
 };
 
+// Drop the index before rebuilding it. Documents are keyed by position
+// ("0", "1", ...) and Upload is insert-or-replace, so re-indexing a
+// differently-chunked document overwrites ids 0..n-1 and silently orphans
+// everything beyond. Changing the chunking from 14 chunks to 5 left 9 stale
+// fragments queryable, which is enough to make an eval run score against
+// content that is no longer in the document.
+//
+// Fine here because the whole corpus is rebuilt from scratch every run. A
+// real system cannot drop a live index: it would key documents by content
+// hash, or build into a new index and swap an alias across.
+try
+{
+    await indexClient.DeleteIndexAsync(indexName, CancellationToken.None);
+}
+catch (RequestFailedException ex) when (ex.Status == 404)
+{
+    // First run on a fresh service — nothing to delete.
+}
+
 await indexClient.CreateOrUpdateIndexAsync(definition);
 
 string document = @"

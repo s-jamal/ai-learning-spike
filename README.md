@@ -5,7 +5,8 @@ generation over a document, and function calling so the model can invoke C# meth
 Written to be understood rather than reused — every mechanism is hand-rolled against the
 raw Azure SDKs, with no orchestration framework.
 
-The working program is [`LlmSpike/Program.cs`](LlmSpike/Program.cs) — a single file, ~300 lines.
+The working program is [`LlmSpike/Program.cs`](LlmSpike/Program.cs) — a single file, ~430 lines,
+including the eval suite it runs against itself.
 
 ---
 
@@ -42,8 +43,9 @@ dotnet user-secrets set "SEARCH_KEY"      "<search admin key>"
 
 Check what's already set with `dotnet user-secrets list`.
 
-**Each run recreates the search index and re-embeds the document**, so it costs a handful
-of API calls on startup. Negligible, but it isn't free.
+**Each run drops and rebuilds the search index, re-embeds the document, and then runs the
+full eval suite** — roughly 20 API calls and 30–60 seconds. Negligible money, but it isn't
+instant like a unit test.
 
 ### Azure resources this expects
 
@@ -63,14 +65,19 @@ deployments.
 
 ## What the program does
 
-Four hardcoded questions are asked against a hardcoded customs declaration:
+A hardcoded customs declaration is indexed, then seven eval cases are run against it:
 
-1. Build an Azure AI Search index (HNSW, 1536-dim vector field) — idempotent.
+1. Drop and rebuild an Azure AI Search index (HNSW, 1536-dim vector field).
 2. Split the document on paragraph breaks, embed each chunk, upload.
 3. Describe three tools to the model: `search_documents`, `calculate_late_penalty`,
    `convert_currency`.
-4. Run a dispatch loop: call the model → if it requests tools, run them and append the
-   results → call again → repeat until it returns text.
+4. For each eval case, run a dispatch loop: call the model → if it requests tools, run them
+   and append the results → call again → repeat until it returns text.
+5. Assert on the answer, print PASS/FAIL per case, exit non-zero if any failed.
+
+The index is dropped rather than updated because documents are keyed by position, so
+re-indexing a smaller set would silently orphan the surplus rows. That bug is written up in
+`notes/session4-evals.md`.
 
 Retrieval is one of the tools, not a fixed pipeline step, so the model decides whether to
 search, writes its own search query, and can search more than once. That choice is the
@@ -90,8 +97,9 @@ Roughly 6 hours across three sessions. Covered and verified working:
 - Function calling: the dispatch loop, tool descriptions, tool error handling
 - Multi-step chaining — search feeding a calculation, unprompted
 - Prompt-level scope control
+- An eval suite: seven cases, pass/fail per case, non-zero exit on failure
 
-Two confirmed failure findings, both written up in the notes and both worth being able to
+Three confirmed failure findings, all written up in the notes and all worth being able to
 tell from memory:
 
 1. **Line-split instead of paragraph-split chunking** severed a paragraph mid-thought and
@@ -99,17 +107,19 @@ tell from memory:
    14,913.60). Reverting the split fixed it — one variable, opposite outcome.
    Grounding instructions prevent invention but not misreading of damaged context.
 2. **Model arithmetic is unreliable.** The fix is a function, not a better prompt.
+3. **A function fixes calculation, not extraction.** Re-breaking the chunking fed
+   `14,793.60` — a number found nowhere in the document — into a correct penalty
+   calculation, producing a flawlessly computed 443.81 instead of 447.41. The eval caught
+   it by asserting the *right* answer; the `MustNotContain` guard against session 1's
+   17,598.05 never fired, because the same root cause produced a different wrong number.
 
 ---
 
 ## What's next
 
-**Now — evals.** The last real item on the learning list, and the one both failure findings
-point at: each was caught only because the right answer happened to be known. Build a set
-of question/expected-answer pairs and a pass/fail runner, then deliberately re-break the
-chunking and watch it go red. Small, self-contained, roughly one session.
+**The learning list is done.** Evals were the last item.
 
-**Then — the real project.** A customs document processing tool, in its own repo:
+**Now — the real project.** A customs document processing tool, in its own repo:
 
 > Upload → Document Intelligence extracts text and fields → chunk and embed → store
 > vectors in Azure AI Search → natural-language Q&A over the document → answers with
@@ -147,6 +157,7 @@ notes/
   session2-azure-ai-search.md
   session3-function-calling.md
   session3-part2-rag-plus-tools.md
+  session4-evals.md
 ```
 
 The two `.txt` snapshots are kept deliberately: they show the two halves separately, before
