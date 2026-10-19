@@ -211,16 +211,122 @@ chatOptions.Tools.Add(currencyTool);
 
 
 // ---------------------------------------------------------------
-// 4. Questions
+// 4. Eval cases
+// ---------------------------------------------------------------
+//
+// Answers are free text and the model is non-deterministic, so assertions
+// are on the critical fact, not the phrasing. MustNotContain is what makes
+// these regression tests rather than smoke tests: the session 1 chunking bug
+// produced "17,598.05", and an answer can mention the right number while
+// still concluding the wrong one.
+
+EvalCase[] evalCases =
+[
+    // --- retrieval only: the fact is stated verbatim in the document ---
+    new EvalCase("What is the total payable on this declaration?",
+        MustContain:    ["14913.60"],
+        MustNotContain: ["17598.05"]),      // the session 1 wrong answer
+
+    new EvalCase("How much import duty is assessed?",
+        MustContain:    ["3120"],
+        MustNotContain: []),
+
+    new EvalCase("What is the HS code for the goods?",
+        MustContain:    ["7307.29"],
+        MustNotContain: []),
+
+    new EvalCase("Who is the importer of record?",
+        MustContain:    ["Nordwind Logistics"],
+        MustNotContain: []),
+
+    // --- retrieval + a tool: the number is nowhere in the document ---
+    new EvalCase("What is the penalty if I pay this declaration 30 days late?",
+        MustContain:    ["447.41"],
+        MustNotContain: []),
+
+    new EvalCase("What is the total payable, in euros?",
+        MustContain:    ["13720.51"],
+        MustNotContain: []),
+
+    // --- scope control: the model knows this and must decline anyway ---
+    new EvalCase("What is the capital of France?",
+        MustContain:    [],
+        MustNotContain: ["Paris"]),
+];
+
+// Strips formatting the model varies between runs: "14,913.60 USD",
+// "$14,913.60" and "14913.60" all normalise to the same string.
+static string Normalize(string text) =>
+    text.Replace(",", "")
+        .Replace(" ", "")
+        .Replace("$", "")
+        .ToLowerInvariant();
+
+
+// ---------------------------------------------------------------
+// 5. Run the evals
 // ---------------------------------------------------------------
 
-await Ask("What is the total payable on this declaration?");
-await Ask("What is the penalty if I pay this declaration 30 days late?");
-await Ask("What is the total payable, in euros?");
-await Ask("What is the capital of France?");
+int passed = 0;
+var failures = new List<string>();
+
+foreach (var evalCase in evalCases)
+{
+    string answer;
+
+    // A case that throws is a failed case, not a dead run. One bad
+    // question shouldn't cost you the results of the other six.
+    try
+    {
+        answer = await Ask(evalCase.Question);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  FAIL — threw {ex.GetType().Name}: {ex.Message}");
+        failures.Add($"{evalCase.Question}\n       threw {ex.GetType().Name}: {ex.Message}");
+        continue;
+    }
+
+    string normalized = Normalize(answer);
+
+    // Expectations are normalised too, so cases can be written readably
+    // as "Nordwind Logistics" rather than "nordwindlogistics".
+    var reasons = new List<string>();
+
+    foreach (string expected in evalCase.MustContain)
+        if (!normalized.Contains(Normalize(expected)))
+            reasons.Add($"missing \"{expected}\"");
+
+    foreach (string forbidden in evalCase.MustNotContain)
+        if (normalized.Contains(Normalize(forbidden)))
+            reasons.Add($"contains \"{forbidden}\"");
+
+    if (reasons.Count == 0)
+    {
+        passed++;
+        Console.WriteLine("  PASS");
+    }
+    else
+    {
+        Console.WriteLine($"  FAIL — {string.Join("; ", reasons)}");
+        failures.Add($"{evalCase.Question}\n       {string.Join("; ", reasons)}\n       got: {answer}");
+    }
+}
+
+Console.WriteLine();
+Console.WriteLine($"=== {passed}/{evalCases.Length} passed ===");
+
+foreach (string failure in failures)
+{
+    Console.WriteLine();
+    Console.WriteLine($"  FAILED: {failure}");
+}
+
+// Non-zero exit code on any failure, so this can run in CI later.
+return failures.Count == 0 ? 0 : 1;
 
 
-async Task Ask(string question)
+async Task<string> Ask(string question)
 {
     Console.WriteLine();
     Console.WriteLine($"=== {question} ===");
@@ -242,8 +348,9 @@ async Task Ask(string question)
 
         if (result.FinishReason != ChatFinishReason.ToolCalls)
         {
-            Console.WriteLine("Answer: " + result.Content[0].Text);
-            return;
+            string answer = result.Content[0].Text;
+            Console.WriteLine("Answer: " + answer);
+            return answer;
         }
 
         messages.Add(new AssistantChatMessage(result));
@@ -300,3 +407,10 @@ async Task<string> RunTool(string name, BinaryData arguments)
 
 
 public partial class Program { }
+
+/// <summary>
+/// One eval: a question, and what the answer must and must not contain
+/// once normalised. Both lists are checked — an answer can cite the correct
+/// figure and still conclude the wrong one.
+/// </summary>
+record EvalCase(string Question, string[] MustContain, string[] MustNotContain);
