@@ -131,5 +131,3 @@ Full pattern covered: retrieval, tool use, multi-step chaining, scope control, e
 **Time spent:** roughly 6 hours across three sessions.
 
 **Next:** leave the spike behind and start the customs document project. Semantic Kernel and evals/guardrails remain on the learning list — Semantic Kernel is optional, a keyword rather than a necessity, since plenty of production .NET LLM work runs against the raw SDK.
-
-

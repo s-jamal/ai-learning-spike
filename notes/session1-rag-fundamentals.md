@@ -265,8 +265,6 @@ Upload → Document Intelligence extracts text and fields → chunk and embed �
 
 ASP.NET Core API, .NET 8, C#. A normal web application that calls three Azure services.
 
-
-
 **Remaining learning sequence:**
 
 Azure AI Search → Semantic Kernel orchestration → function calling → evals and guardrails
@@ -274,8 +272,6 @@ Azure AI Search → Semantic Kernel orchestration → function calling → evals
 ---
 
 ## 7. Talking points
-
-
 
 The keyword-vs-vector contrast is worth keeping as a talking point: a Solr keyword index can't match "how much duty do I owe" against a paragraph about tax breakdowns, because there are no shared terms. Understanding why that happens is the part worth retaining.
 
